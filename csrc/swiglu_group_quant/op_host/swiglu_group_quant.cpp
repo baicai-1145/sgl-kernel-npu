@@ -710,7 +710,20 @@ HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor> swiglu_group_quant(
     // The kernel reads GetBlockNum() for its used-core count when there is no group index, so the
     // launch dim must be coreNum when a group index is present (each core walks the whole group
     // list), else the reduced used-core count.
-    const int64_t blockDim = inputs.hasGroupIndex ? tilingData.coreNum : tiling.UsedCoreNums();
+    //
+    // With a group index, though, coreNum blocks is wasteful when the batch is small: every block
+    // runs Init(), and Init() must itself copy+reduce the whole group list to learn the real row
+    // count. For a decode-shaped call (bs=6, coreNum=56, 160 experts) that means 56 blocks each
+    // reduce 160 group entries so that 6 of them can process one row each, and the kernel measures
+    // as pure scalar overhead (aiv_scalar_ratio ~0.82 at 49KB of payload).
+    //
+    // No group can hold more rows than bs (a group counts only when positive, and the counts sum
+    // to at most bs), so launching min(bs, coreNum) blocks still covers every active group: the
+    // kernel derives usedCoreNums = min(ceil(realBs / ceil(realBs / coreNum)), coreNum) from the
+    // tiling's coreNum, which is <= min(realBs, coreNum) <= min(bs, coreNum) = blockDim. The
+    // remaining blocks would have returned immediately from Process() anyway.
+    const int64_t blockDim =
+        inputs.hasGroupIndex ? std::min(inputs.bs, tilingData.coreNum) : tiling.UsedCoreNums();
     EXEC_KERNEL_CMD(swiglu_group_quant, blockDim, x, topk_weight_ptr, group_index_ptr, y, scale, y_origin,
                     workspace_tensor, tilingTensor);
 
